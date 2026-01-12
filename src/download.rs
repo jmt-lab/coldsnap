@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::NamedTempFile;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Snafu)]
 pub struct Error(error::Error);
@@ -32,6 +33,7 @@ type Result<T> = std::result::Result<T, Error>;
 const GIBIBYTE: i64 = 1024 * 1024 * 1024;
 const SNAPSHOT_BLOCK_WORKERS: usize = 64;
 const SNAPSHOT_BLOCK_ATTEMPTS: u8 = 3;
+const SNAPSHOT_BLOCK_TIMEOUT: Duration = Duration::from_secs(90);
 const SHA256_ALGORITHM: &str = "SHA256";
 
 // ListSnapshotBlocks allows us to specify how many blocks are returned in each
@@ -135,7 +137,18 @@ impl SnapshotDownloader {
             SNAPSHOT_BLOCK_WORKERS,
             |context| async move {
                 for i in 0..SNAPSHOT_BLOCK_ATTEMPTS {
-                    let block_result = self.download_block(&context).await;
+                    let block_result = match timeout(
+                        SNAPSHOT_BLOCK_TIMEOUT,
+                        self.download_block(&context),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(Error(error::Error::BlockTimeout {
+                            snapshot_id: context.snapshot_id.clone(),
+                            block_index: context.block_index,
+                        })),
+                    };
                     let mut block_errors = context.block_errors.lock().expect("poisoned");
                     if let Err(e) = block_result {
                         debug!(
@@ -591,6 +604,9 @@ mod error {
             needed
         ))]
         BlockDeviceTooSmall { block_device_size: i64, needed: i64 },
+
+        #[snafu(display("Timeout downloading block {} for snapshot '{}'", block_index, snapshot_id))]
+        BlockTimeout { snapshot_id: String, block_index: i32 },
 
         #[snafu(display("Failed to validate file name '{}'", path.display()))]
         ValidateFileName { path: PathBuf },
